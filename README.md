@@ -67,7 +67,7 @@ Commands:
   config    Manage aw-import-screentime TOML configuration.
   devices   List available DevicePeer identifiers (optionally with stream-dir paths).
   file      Inspect a single SEGB file (raw protobufs or stitched intervals).
-  watch     Purely event-driven watcher: - Uses watchdog to wake on SEGB file changes (create/modify/move). - On each wake, decodes only *new* protobufs (cf watermark per device). - Stitches them into historical ActivityWatch interval events with true timestamps. - Inserts events via insert_events (no heartbeats).
+  watch     Watch source files with an idle safety rescan.
   events
 ```
 
@@ -106,6 +106,14 @@ aw-import-screentime watch --device ABCDEF0123456789
 - `--storefront` mirrors the events commands for title enrichment locales.
 - `--testing/--no-testing` and `--port` control which ActivityWatch server receives events.
 - Maintains per-device watermarks and automatically retries failed inserts after a short delay.
+- On startup, filesystem notifications, and the 60-second idle safety rescan, reads
+  every eligible source file for each device being scanned. These are non-hidden
+  regular files directly in the device's App.InFocus directory. Modification time,
+  filename order, and unchanged metadata do not limit the scan; only events newer
+  than the saved per-device event checkpoint (`last_cf`) are processed.
+- Each scan decodes all retained files, including records older than the checkpoint.
+  Scan cost therefore grows with retained data. The `events --limit` option applies
+  to explicit preview/import operations, not to `watch`.
 - If omitted, these options can come from `aw-import-screentime.toml`.
 
 ### `events`
@@ -213,3 +221,28 @@ ActivityWatch production data in tests, fixtures, issues, or pull requests.
 
 - **The Biome folders are empty.** Unlock Screen Time, enable “Share Across Devices” on both macOS and iOS, then give iCloud a few minutes to sync. You can verify files are present with `ls ~/Library/Biome/streams/restricted/App.InFocus/remote`.
 - **Permission denied when reading Biome.** Confirm your shell or IDE already has Full Disk Access (System Settings → Privacy & Security → Full Disk Access). Restart the terminal after granting access.
+- **Watcher is alive but activity stopped appearing.** Earlier versions selected
+  the two files with the newest modification times, then often read only one.
+  Biome can append current events without changing file metadata while an older
+  file receives a newer modification time. The watcher now scans all retained
+  source files. After installing this fix, restart your existing watcher using
+  the same configuration, server, and bucket suffix. Startup catch-up recovers
+  retained events newer than the saved checkpoint without resetting state;
+  existing open intervals and ActivityWatch deduplication are preserved. Events
+  at or before the checkpoint are outside this recovery path.
+- **Source scan failed / checkpoint unchanged.** At warning level, the watcher
+  reports a failed source scan and keeps that device's checkpoint and open
+  interval unchanged. Check Full Disk Access, source readability, and the reported
+  decoding error. A vanished file, zero-byte or unsupported SEGB file, or malformed
+  non-empty protobuf can block the device's whole scan, including when the bad
+  record is in an old retained file. The next notification or idle rescan retries;
+  unread data is not reported as imported. Empty and null-padded records inside a
+  readable stream retain their existing skip behavior. Empty/missing source
+  directories during scans do not advance state. Do not delete source files or
+  reset checkpoints to suppress an error.
+
+After an owner-managed restart, check normal logs for inserts or duplicate skips
+and any source-scan warnings, then verify the expected device bucket in
+ActivityWatch. Catch-up uses the normal sink and can insert previously unread
+activity. Reverting the code does not remove activity already inserted; retain
+the state and configuration when rolling back.

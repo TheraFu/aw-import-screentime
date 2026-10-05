@@ -5,6 +5,7 @@ import json
 import logging
 import sqlite3
 import shutil
+import stat
 import threading
 import time
 from dataclasses import dataclass, field
@@ -624,12 +625,17 @@ def iter_device_files(device_id: DeviceId) -> Iterator[Path]:
     """
     base = STREAMS_DIR / device_id
     try:
-        files = [
-            p for p in base.iterdir() if p.is_file() and not p.name.startswith(".")
-        ]
+        entries = list(base.iterdir())
     except (FileNotFoundError, PermissionError) as e:
         logger.warning("Skipping device %s: %s", device_id, e)
         return iter(())
+    # Unlike is_file(), stat() propagates a vanished entry so a watcher scan
+    # cannot silently skip unread data and commit a later checkpoint.
+    files = [
+        p
+        for p in entries
+        if not p.name.startswith(".") and stat.S_ISREG(p.stat().st_mode)
+    ]
     files.sort(key=lambda p: p.stat().st_mtime)  # oldest → newest
     logger.debug("Enumerated files for %s: %d file(s)", device_id, len(files))
     return iter(files)
@@ -694,10 +700,7 @@ def load_device_states() -> dict[DeviceId, "DeviceState"]:
 
         raw = data.get("last_cf", {})
         if isinstance(raw, dict):
-            return {
-                str(k): DeviceState(last_cf=float(v))
-                for k, v in raw.items()
-            }
+            return {str(k): DeviceState(last_cf=float(v)) for k, v in raw.items()}
     except Exception:
         logger.debug("No prior watermark state or failed to read; starting fresh")
     return {}
@@ -706,8 +709,7 @@ def load_device_states() -> dict[DeviceId, "DeviceState"]:
 def load_watermarks() -> Watermarks:
     """Backward-compatible view of persisted last_cf values."""
     return {
-        device_id: state.last_cf
-        for device_id, state in load_device_states().items()
+        device_id: state.last_cf for device_id, state in load_device_states().items()
     }
 
 
@@ -747,10 +749,7 @@ def save_device_states(device_states: dict[DeviceId, "DeviceState"]) -> None:
 def save_watermarks(last_cf: Watermarks) -> None:
     """Backward-compatible state writer for last_cf-only callers."""
     save_device_states(
-        {
-            device_id: DeviceState(last_cf=cf)
-            for device_id, cf in last_cf.items()
-        }
+        {device_id: DeviceState(last_cf=cf) for device_id, cf in last_cf.items()}
     )
 
 
@@ -781,55 +780,40 @@ class NewEvents:
     dirty: bool
 
 
-WATCH_TAIL_FILE_LIMIT = 2
 WATCH_SAFETY_RESCAN_SECONDS = 60.0
 
 
 def read_new_events_for_device(
     dev: DeviceId,
     state: DeviceState,
-    *,
-    tail_limit: int = WATCH_TAIL_FILE_LIMIT,
 ) -> NewEvents:
-    """Return decoded protobufs newer than the watermark without mutating state."""
-    files = tail_device_files(dev, limit=tail_limit)
-    if not files:
-        logger.debug("[%s] no files found", dev)
-        return NewEvents([], None, None, False)
+    """Scan all retained files for events newer than the checkpoint, without mutation.
 
-    newest = files[-1]
-    try:
-        newest.stat()
-    except FileNotFoundError:
-        logger.debug("[%s] newest file disappeared: %s", dev, newest)
-        return NewEvents([], None, None, False)
-
-    prev_file = state.last_file
-    prev_file_name: Optional[str] = prev_file.name if prev_file is not None else None
-    logger.debug(
-        "[%s] newest=%s last_file=%s last_cf=%.3f",
-        dev,
-        newest.name,
-        prev_file_name,
-        state.last_cf,
-    )
-
-    candidates = files if state.last_file != newest else [newest]
-
+    File metadata does not reliably track Biome appends. A partial scan cannot
+    safely advance the checkpoint, so discard the whole batch on a read failure.
+    """
+    source = STREAMS_DIR / dev
     new_events: list[AppInFocusEventT] = []
     try:
-        for fp in candidates:
-            for ev in iter_app_in_focus_events(fp):
+        files = list(iter_device_files(dev))
+        for source in files:
+            for ev in iter_app_in_focus_events(source, strict=True):
                 cf = getattr(ev, "cf_absolute_time", None)
                 if cf is None or cf <= state.last_cf:
                     continue
                 new_events.append(ev)
     except Exception as e:
-        logger.debug("[%s] read_new_events_for_device(%s) error: %s", dev, newest, e)
+        logger.warning(
+            "[%s] Source scan failed at %s; checkpoint unchanged; "
+            "will retry on the next scan. Check source readability: %s",
+            dev,
+            source,
+            e,
+        )
         return NewEvents([], None, None, False)
 
     if not new_events:
-        logger.debug("[%s] no new events in candidates", dev)
+        logger.debug("[%s] no new events in source files", dev)
         return NewEvents([], None, None, False)
 
     max_cf = max(getattr(e, "cf_absolute_time", state.last_cf) for e in new_events)
@@ -840,7 +824,7 @@ def read_new_events_for_device(
         state.last_cf,
         max_cf,
     )
-    return NewEvents(new_events, newest, max_cf, True)
+    return NewEvents(new_events, files[-1], max_cf, True)
 
 
 def drain_changed_devices(
@@ -871,8 +855,10 @@ def determine_watch_scan_targets(
 # --------------------------------------------------------------------------------------
 
 
-def iter_app_in_focus_events(file_path: Path) -> Iterator[AppInFocusEventT]:
-    """Yield parsed AppInFocusEvent protobufs from a SEGB file."""
+def iter_app_in_focus_events(
+    file_path: Path, *, strict: bool = False
+) -> Iterator[AppInFocusEventT]:
+    """Yield protobufs; strict watcher scans must not checkpoint past parse errors."""
     for record in ccl_segb.read_segb_file(str(file_path)):
         data = getattr(record, "data", b"")
         if not data:
@@ -891,6 +877,8 @@ def iter_app_in_focus_events(file_path: Path) -> Iterator[AppInFocusEventT]:
             )
             yield ev
         except Exception as e:
+            if strict:
+                raise
             logger.debug("Error parsing protobuf in %s: %s", file_path, e)
             continue
 
@@ -1620,9 +1608,9 @@ def cmd_watch(
     storefront: Optional[list[str]] = typer.Option(None, "--storefront"),
 ):
     """
-    Purely event-driven watcher:
+    Watch source files with an idle safety rescan:
     - Uses watchdog to wake on SEGB file changes (create/modify/move).
-    - On each wake, decodes only *new* protobufs (cf watermark per device).
+    - Scans all retained source files and processes events newer than each checkpoint.
     - Stitches them into historical ActivityWatch interval events with true timestamps.
     - Inserts events via insert_events (no heartbeats).
     """
@@ -1762,7 +1750,7 @@ def cmd_watch(
         changed.update(ids)
     wake.set()
 
-    # main loop (purely event-driven: no timeout polling)
+    # Filesystem notifications plus an idle safety rescan.
     with client:
         try:
             while True:
